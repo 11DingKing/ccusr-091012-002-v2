@@ -10,13 +10,13 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import Unit, Category, Variety, Goods, StockIn, Warning
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    GoodsSerializer, StockInSerializer,
+    WarningSerializer
 )
 
 logger = logging.getLogger('apps')
@@ -589,46 +589,27 @@ class GoodsListView(APIView):
 class StockInListView(APIView):
     """入库记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
-        })
 
-
-class StockOutListView(APIView):
-    """出库记录列表视图"""
-    permission_classes = [IsAuthenticated]
-    
     def get(self, request):
+        queryset = StockIn.objects.select_related('goods', 'operator').order_by('-stock_in_time')
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+
+        page = max(int(request.query_params.get('page', 1)), 1)
+        page_size = max(int(request.query_params.get('page_size', 10)), 1)
+        total = queryset.count()
+        items = queryset[(page - 1) * page_size:page * page_size]
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': StockInSerializer(items, many=True).data,
+            'total': total, 'page': page, 'page_size': page_size,
         })
 
 
 class WarningListView(APIView):
     """预警记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
-        })
 
-
-class ApprovalListView(APIView):
-    """审批记录列表视图"""
-    permission_classes = [IsAuthenticated]
-    
     def get(self, request):
         return success_response(data={
             'list': [],

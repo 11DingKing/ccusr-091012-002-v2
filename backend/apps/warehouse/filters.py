@@ -3,7 +3,9 @@
 """
 import django_filters
 from django.db.models import F
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, ApprovalTask,
+)
 
 
 class UnitFilter(django_filters.FilterSet):
@@ -88,10 +90,13 @@ class WarningFilter(django_filters.FilterSet):
         fields = ['is_read', 'type']
 
 
-class ApprovalFilter(django_filters.FilterSet):
-    """审批过滤器"""
+class ApprovalTaskFilter(django_filters.FilterSet):
+    """签署任务过滤器"""
     status = django_filters.CharFilter(field_name='status')
-    
+    approver_id = django_filters.NumberFilter(field_name='approver_id')
+    stock_out_id = django_filters.NumberFilter(field_name='stock_out_id')
+    generation = django_filters.NumberFilter(field_name='generation')
+
     class Meta:
-        model = Approval
-        fields = ['status']
+        model = ApprovalTask
+        fields = ['status', 'approver_id', 'stock_out_id', 'generation']
