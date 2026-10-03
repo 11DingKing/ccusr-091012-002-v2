@@ -3,20 +3,31 @@
 """
 import logging
 import io
+from django.db import transaction
 from django.http import HttpResponse
 from rest_framework.views import APIView
 from rest_framework.permissions import IsAuthenticated
-from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.parsers import MultiPartParser, FormParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from apps.authentication.models import User
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning,
+    ApprovalRuleVersion, ApprovalRoleAssignment,
+)
+from . import approval_engine
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
-    GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    GoodsSerializer, GoodsCreateSerializer,
+    StockInSerializer, StockOutSerializer, StockOutCreateSerializer,
+    StockOutDetailSerializer, StockOutResubmitSerializer,
+    WarningSerializer,
+    ApprovalRuleVersionSerializer, RuleVersionPublishSerializer,
+    RoleAssignmentSerializer,
+    SignActionSerializer, RecuseSerializer, DelegateSerializer,
 )
 
 logger = logging.getLogger('apps')
@@ -381,8 +392,7 @@ class VarietyTemplateView(APIView):
     def get(self, request):
         # 从URL参数获取token进行验证
         from apps.authentication.backends import decode_token
-        from apps.authentication.models import User
-        
+
         token = request.query_params.get('token')
         if not token:
             return error_response(message='缺少认证信息', code=401)
@@ -392,7 +402,7 @@ class VarietyTemplateView(APIView):
             return error_response(message='认证信息无效或已过期', code=401)
         
         try:
-            user = User.objects.get(pk=payload['user_id'])
+            User.objects.get(pk=payload['user_id'])
         except User.DoesNotExist:
             return error_response(message='用户不存在', code=401)
         
@@ -474,7 +484,7 @@ class VarietyImportView(APIView):
         try:
             wb = load_workbook(file)
             ws = wb.active
-        except Exception as e:
+        except Exception:
             return error_response(message='文件格式错误，请上传Excel文件')
         
         # 获取所有品类及其单位
@@ -561,78 +571,542 @@ class VarietyImportView(APIView):
         )
 
 
-# ==================== 其他视图占位 ====================
-
-class DashboardView(APIView):
-    """仪表盘视图"""
-    permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        return success_response(data={
-            'message': '仪表盘功能开发中...'
-        })
-
+# ==================== 货物管理 ====================
 
 class GoodsListView(APIView):
-    """货物列表视图"""
+    """货物列表/创建"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = Goods.objects.select_related(
+            'variety__category__unit'
+        ).all().order_by('-created_at')
+
+        keyword = request.query_params.get('keyword')
+        if keyword:
+            queryset = queryset.filter(name__icontains=keyword)
+        risk_level = request.query_params.get('risk_level')
+        if risk_level:
+            queryset = queryset.filter(risk_level=risk_level)
+        variety_id = request.query_params.get('variety')
+        if variety_id:
+            queryset = queryset.filter(variety_id=variety_id)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+
+        total = queryset.count()
+        goods = queryset[start:end]
+        serializer = GoodsSerializer(goods, many=True)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data, 'total': total,
+            'page': page, 'page_size': page_size
         })
 
+    def post(self, request):
+        serializer = GoodsCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+        data = serializer.validated_data
+        goods = Goods.objects.create(**data)
+        logger.info(f"User {request.user.username} created goods {goods.code}")
+        return success_response(data=GoodsSerializer(goods).data, message='创建成功')
+
+
+class GoodsDetailView(APIView):
+    """货物详情/更新/删除"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            goods = Goods.objects.select_related('variety__category__unit').get(pk=pk)
+        except Goods.DoesNotExist:
+            return error_response(message='货物不存在', code=404)
+        return success_response(data=GoodsSerializer(goods).data)
+
+    def put(self, request, pk):
+        try:
+            goods = Goods.objects.get(pk=pk)
+        except Goods.DoesNotExist:
+            return error_response(message='货物不存在', code=404)
+        serializer = GoodsCreateSerializer(data=request.data, context={'instance': goods})
+        if not serializer.is_valid():
+            first_error = list(serializer.errors.values())[0]
+            if isinstance(first_error, list):
+                first_error = first_error[0]
+            return error_response(message=str(first_error))
+        for field, value in serializer.validated_data.items():
+            setattr(goods, field, value)
+        goods.save()
+        return success_response(data=GoodsSerializer(goods).data, message='更新成功')
+
+    def delete(self, request, pk):
+        try:
+            goods = Goods.objects.get(pk=pk)
+        except Goods.DoesNotExist:
+            return error_response(message='货物不存在', code=404)
+        if goods.stock_ins.exists() or goods.stock_outs.exists():
+            return error_response(message='货物存在出入库记录，无法删除')
+        goods.delete()
+        return success_response(message='删除成功')
+
+
+# ==================== 入库记录 ====================
 
 class StockInListView(APIView):
-    """入库记录列表视图"""
+    """入库记录列表/登记"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockIn.objects.select_related('goods', 'operator').all().order_by('-stock_in_time')
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+        total = queryset.count()
+        serializer = StockInSerializer(queryset[start:end], many=True)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data, 'total': total,
+            'page': page, 'page_size': page_size
         })
+
+    def post(self, request):
+        goods_id = request.data.get('goods')
+        try:
+            goods = Goods.objects.get(pk=goods_id)
+        except (Goods.DoesNotExist, ValueError, TypeError):
+            return error_response(message='货物不存在')
+
+        from decimal import Decimal
+        try:
+            quantity = Decimal(str(request.data.get('quantity')))
+            assert quantity > 0
+        except Exception:
+            return error_response(message='入库数量必须大于 0')
+
+        with transaction.atomic():
+            record = StockIn.objects.create(
+                goods=goods, operator=request.user, quantity=quantity,
+                batch_no=request.data.get('batch_no', ''),
+                supplier=request.data.get('supplier', ''),
+                remark=request.data.get('remark', ''),
+            )
+            goods.quantity += quantity
+            goods.save(update_fields=['quantity'])
+        logger.info(f"User {request.user.username} stocked in {quantity} of goods {goods.code}")
+        return success_response(data=StockInSerializer(record).data, message='入库成功')
+
+
+# ==================== 出库申请与审批 ====================
+
+def _first_error(serializer):
+    first_error = list(serializer.errors.values())[0]
+    if isinstance(first_error, list):
+        first_error = first_error[0]
+    return str(first_error)
 
 
 class StockOutListView(APIView):
-    """出库记录列表视图"""
+    """出库申请列表 / 创建（创建即提交，冻结规则快照）"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
+        queryset = StockOut.objects.select_related(
+            'goods', 'operator', 'current_step', 'rule_version'
+        ).all().order_by('-created_at')
+
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
+        goods_id = request.query_params.get('goods_id')
+        if goods_id:
+            queryset = queryset.filter(goods_id=goods_id)
+        # 默认只看本人申请；管理员可看全部
+        scope = request.query_params.get('scope', 'mine')
+        if scope == 'mine':
+            queryset = queryset.filter(operator=request.user)
+        elif scope == 'todo':
+            # 待当前用户签署
+            queryset = queryset.filter(
+                status=StockOut.STATUS_PENDING,
+                current_step__signers__user=request.user,
+                current_step__signers__status='pending',
+            ).distinct()
+        elif scope == 'blocked':
+            # 节点阻塞、等待管理员改派
+            if not request.user.is_admin:
+                return error_response(message='仅管理员可查看阻塞中的申请', code=403)
+            queryset = queryset.filter(
+                status=StockOut.STATUS_PENDING,
+                current_step__status='blocked',
+            )
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+        total = queryset.count()
+        serializer = StockOutSerializer(queryset[start:end], many=True)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data, 'total': total,
+            'page': page, 'page_size': page_size
         })
 
+    def post(self, request):
+        serializer = StockOutCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        data = serializer.validated_data
+        try:
+            stock_out = StockOut(
+                goods=data['goods'],
+                operator=request.user,
+                receiver=data['receiver'],
+                receiver_dept=data.get('receiver_dept', ''),
+                quantity=data['quantity'],
+                purpose_type=data.get('purpose_type', StockOut.PURPOSE_USE),
+                purpose=data.get('purpose', ''),
+                remark=data.get('remark', ''),
+                status=StockOut.STATUS_DRAFT,
+            )
+            approval_engine.instantiate_route(stock_out, actor=request.user)
+        except approval_engine.ApprovalConfigError as exc:
+            return error_response(message=str(exc))
+        stock_out = StockOut.objects.select_related(
+            'goods', 'operator', 'current_step', 'rule_version').get(pk=stock_out.pk)
+        logger.info(f"User {request.user.username} submitted stock-out {stock_out.id}")
+        return success_response(data=StockOutDetailSerializer(stock_out).data, message='提交成功，审批路线已生成')
+
+
+class StockOutDetailView(APIView):
+    """申请详情：含完整路线、签署状态、事件流与签署理由解释"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        stock_out = self._get_object(pk)
+        if stock_out is None:
+            return error_response(message='申请不存在', code=404)
+        return success_response(data=StockOutDetailSerializer(stock_out).data)
+
+    def _get_object(self, pk):
+        try:
+            return (
+                StockOut.objects
+                .select_related('goods', 'operator', 'current_step', 'rule_version')
+                .prefetch_related(
+                    'steps__signers__user', 'events__actor', 'events__step')
+                .get(pk=pk)
+            )
+        except StockOut.DoesNotExist:
+            return None
+
+
+class StockOutSignView(APIView):
+    """当前节点签署：通过 / 拒绝（多人并发安全）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        serializer = SignActionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        try:
+            stock_out, _ = approval_engine.sign_approval(
+                pk, request.user,
+                serializer.validated_data['action'],
+                serializer.validated_data.get('comment', ''),
+            )
+        except approval_engine.ApprovalStateError as exc:
+            return error_response(message=str(exc))
+        except StockOut.DoesNotExist:
+            return error_response(message='申请不存在', code=404)
+        stock_out = StockOut.objects.select_related(
+            'goods', 'operator', 'current_step', 'rule_version').get(pk=stock_out.id)
+        message = '已通过' if serializer.validated_data['action'] == 'approve' else '已拒绝，申请流程终止'
+        return success_response(data=StockOutDetailSerializer(stock_out).data, message=message)
+
+
+class StockOutRecuseView(APIView):
+    """当前签署人主动回避"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        serializer = RecuseSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        try:
+            stock_out, step = approval_engine.recuse(
+                pk, request.user, serializer.validated_data.get('comment', ''))
+        except approval_engine.ApprovalStateError as exc:
+            return error_response(message=str(exc))
+        except StockOut.DoesNotExist:
+            return error_response(message='申请不存在', code=404)
+        if step.status == 'blocked':
+            message = '已回避，当前节点无可用审批人，已阻塞等待管理员改派'
+        else:
+            message = '已回避，等待同节点其他审批人签署'
+        stock_out = StockOut.objects.select_related(
+            'goods', 'operator', 'current_step', 'rule_version').get(pk=stock_out.id)
+        return success_response(data=StockOutDetailSerializer(stock_out).data, message=message)
+
+
+class StockOutDelegateView(APIView):
+    """管理员对阻塞节点改派审批人"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        if not request.user.is_admin:
+            return error_response(message='仅管理员可以改派审批人', code=403)
+        serializer = DelegateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        try:
+            stock_out, _, _ = approval_engine.delegate(
+                pk, request.user, serializer.validated_data['user'],
+                serializer.validated_data.get('comment', ''))
+        except approval_engine.ApprovalStateError as exc:
+            return error_response(message=str(exc))
+        except StockOut.DoesNotExist:
+            return error_response(message='申请不存在', code=404)
+        stock_out = StockOut.objects.select_related(
+            'goods', 'operator', 'current_step', 'rule_version').get(pk=stock_out.id)
+        return success_response(data=StockOutDetailSerializer(stock_out).data, message='改派成功，节点恢复签署')
+
+
+class StockOutCancelView(APIView):
+    """撤销审批中的申请"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            stock_out = approval_engine.cancel(pk, request.user)
+        except approval_engine.ApprovalStateError as exc:
+            return error_response(message=str(exc))
+        except StockOut.DoesNotExist:
+            return error_response(message='申请不存在', code=404)
+        stock_out = StockOut.objects.select_related(
+            'goods', 'operator', 'current_step', 'rule_version').get(pk=stock_out.id)
+        return success_response(data=StockOutDetailSerializer(stock_out).data, message='申请已撤销')
+
+
+class StockOutResubmitView(APIView):
+    """拒绝后重提：新申请、修订号 +1、按当前生效规则重新评估冻结"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            rejected = StockOut.objects.get(pk=pk)
+        except StockOut.DoesNotExist:
+            return error_response(message='申请不存在', code=404)
+        if rejected.operator_id != request.user.id and not request.user.is_admin:
+            return error_response(message='仅申请人本人可以重新提交', code=403)
+        data = request.data or {}
+        serializer = StockOutResubmitSerializer(data={
+            'goods': data.get('goods', rejected.goods_id),
+            'receiver': data.get('receiver', rejected.receiver),
+            'receiver_dept': data.get('receiver_dept', rejected.receiver_dept),
+            'quantity': data.get('quantity', rejected.quantity),
+            'purpose_type': data.get('purpose_type', rejected.purpose_type),
+            'purpose': data.get('purpose', rejected.purpose),
+            'remark': data.get('remark', rejected.remark),
+        })
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        overrides = serializer.validated_data
+        try:
+            application = approval_engine.resubmit(rejected, request.user, **overrides)
+        except (approval_engine.ApprovalStateError, approval_engine.ApprovalConfigError) as exc:
+            return error_response(message=str(exc))
+        application = StockOut.objects.select_related(
+            'goods', 'operator', 'current_step', 'rule_version').get(pk=application.id)
+        return success_response(
+            data=StockOutDetailSerializer(application).data,
+            message=f'已第 {application.revision_no} 次提交并按最新规则生成审批路线')
+
+
+class StockOutReevaluateView(APIView):
+    """条件变化重新评估：规则版本不变、按新条件重算路线（仅限尚无人工签署时）"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        try:
+            stock_out = StockOut.objects.get(pk=pk)
+        except StockOut.DoesNotExist:
+            return error_response(message='申请不存在', code=404)
+        if stock_out.operator_id != request.user.id and not request.user.is_admin:
+            return error_response(message='仅申请人本人可以变更申请条件', code=403)
+
+        allowed = {'quantity', 'receiver_dept', 'purpose_type', 'purpose', 'receiver', 'goods'}
+        changes = {k: v for k, v in request.data.items() if k in allowed}
+        if not changes:
+            return error_response(message='未提供任何可变更字段（goods/quantity/receiver_dept/purpose_type/purpose/receiver）')
+
+        from decimal import Decimal
+        if 'goods' in changes:
+            try:
+                changes['goods'] = Goods.objects.get(pk=changes['goods'])
+            except (Goods.DoesNotExist, ValueError, TypeError):
+                return error_response(message='货物不存在')
+        if 'quantity' in changes:
+            try:
+                changes['quantity'] = Decimal(str(changes['quantity']))
+                assert changes['quantity'] > 0
+                target_goods = changes.get('goods', stock_out.goods)
+                if changes['quantity'] > target_goods.quantity:
+                    return error_response(message=f"库存不足，当前库存 {target_goods.quantity}")
+            except Exception:
+                return error_response(message='出库数量非法')
+        try:
+            stock_out = approval_engine.reevaluate(stock_out, request.user, **changes)
+        except (approval_engine.ApprovalStateError, approval_engine.ApprovalConfigError) as exc:
+            return error_response(message=str(exc))
+        stock_out = StockOut.objects.select_related(
+            'goods', 'operator', 'current_step', 'rule_version').get(pk=stock_out.id)
+        return success_response(data=StockOutDetailSerializer(stock_out).data,
+                               message='条件已变更，审批路线已按同一规则版本重新评估')
+
+
+# ==================== 审批规则版本 ====================
+
+def _require_admin(request):
+    return request.user.is_admin
+
+
+class ApprovalRuleVersionListView(APIView):
+    """规则版本列表 / 发布新版本（旧版本自动归档，不影响在办路线）"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        versions = ApprovalRuleVersion.objects.all().order_by('-version')
+        serializer = ApprovalRuleVersionSerializer(versions, many=True)
+        active = versions.filter(status=ApprovalRuleVersion.STATUS_ACTIVE).first()
+        return success_response(data={
+            'list': serializer.data,
+            'active_version': active.version if active else None,
+            'roles': [
+                {'code': code, 'name': name} for code, name in approval_engine.ROLE_CHOICES
+            ],
+            'default_nodes': approval_engine.DEFAULT_NODES,
+        })
+
+    def post(self, request):
+        if not _require_admin(request):
+            return error_response(message='仅管理员可以发布审批规则', code=403)
+        serializer = RuleVersionPublishSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        try:
+            rule = approval_engine.publish_version(
+                serializer.validated_data['nodes'],
+                serializer.validated_data.get('remark', ''),
+                created_by=request.user,
+            )
+        except approval_engine.ApprovalConfigError as exc:
+            return error_response(message=str(exc))
+        logger.info(f"User {request.user.username} published approval rule v{rule.version}")
+        return success_response(data=ApprovalRuleVersionSerializer(rule).data,
+                               message=f'规则 v{rule.version} 已发布生效')
+
+
+class ApprovalRuleVersionDetailView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        try:
+            rule = ApprovalRuleVersion.objects.get(pk=pk)
+        except ApprovalRuleVersion.DoesNotExist:
+            return error_response(message='规则版本不存在', code=404)
+        return success_response(data=ApprovalRuleVersionSerializer(rule).data)
+
+
+# ==================== 审批角色指派 ====================
+
+class RoleAssignmentListView(APIView):
+    """审批角色指派列表 / 新增指派"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = ApprovalRoleAssignment.objects.select_related('user').all().order_by('id')
+        role_code = request.query_params.get('role_code')
+        if role_code:
+            qs = qs.filter(role_code=role_code)
+        scope_dept = request.query_params.get('scope_dept')
+        if scope_dept is not None:
+            qs = qs.filter(scope_dept=scope_dept)
+        serializer = RoleAssignmentSerializer(qs, many=True)
+        return success_response(data={
+            'list': serializer.data,
+            'roles': [{'code': code, 'name': name} for code, name in approval_engine.ROLE_CHOICES],
+        })
+
+    def post(self, request):
+        if not _require_admin(request):
+            return error_response(message='仅管理员可以配置审批人', code=403)
+        serializer = RoleAssignmentSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        assignment = serializer.save(created_by=request.user)
+        return success_response(data=RoleAssignmentSerializer(assignment).data, message='指派成功')
+
+
+class RoleAssignmentDetailView(APIView):
+    """更新/删除单条指派"""
+    permission_classes = [IsAuthenticated]
+
+    def put(self, request, pk):
+        if not _require_admin(request):
+            return error_response(message='仅管理员可以配置审批人', code=403)
+        try:
+            assignment = ApprovalRoleAssignment.objects.get(pk=pk)
+        except ApprovalRoleAssignment.DoesNotExist:
+            return error_response(message='指派不存在', code=404)
+        serializer = RoleAssignmentSerializer(assignment, data=request.data, partial=True)
+        if not serializer.is_valid():
+            return error_response(message=_first_error(serializer))
+        serializer.save()
+        return success_response(data=RoleAssignmentSerializer(assignment).data, message='更新成功')
+
+    def delete(self, request, pk):
+        if not _require_admin(request):
+            return error_response(message='仅管理员可以配置审批人', code=403)
+        try:
+            assignment = ApprovalRoleAssignment.objects.get(pk=pk)
+        except ApprovalRoleAssignment.DoesNotExist:
+            return error_response(message='指派不存在', code=404)
+        assignment.delete()
+        return success_response(message='已移除指派')
+
+
+# ==================== 预警记录 ====================
 
 class WarningListView(APIView):
-    """预警记录列表视图"""
+    """预警记录列表"""
     permission_classes = [IsAuthenticated]
-    
-    def get(self, request):
-        return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
-        })
 
-
-class ApprovalListView(APIView):
-    """审批记录列表视图"""
-    permission_classes = [IsAuthenticated]
-    
     def get(self, request):
+        queryset = Warning.objects.select_related('goods').all().order_by('-created_at')
+        warning_type = request.query_params.get('type')
+        if warning_type:
+            queryset = queryset.filter(type=warning_type)
+        is_read = request.query_params.get('is_read')
+        if is_read in ('true', 'false'):
+            queryset = queryset.filter(is_read=is_read == 'true')
+
+        page = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        start = (page - 1) * page_size
+        end = start + page_size
+        total = queryset.count()
+        serializer = WarningSerializer(queryset[start:end], many=True)
         return success_response(data={
-            'list': [],
-            'total': 0,
-            'page': 1,
-            'page_size': 10
+            'list': serializer.data, 'total': total,
+            'page': page, 'page_size': page_size
         })

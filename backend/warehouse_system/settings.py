@@ -33,7 +33,9 @@ TEMPLATES = []
 WSGI_APPLICATION = "warehouse_system.wsgi.application"
 DATABASES = {
     "default": {
-        "ENGINE": "django.db.backends.sqlite3",
+        # IMMEDIATE 事务：开始即取保留写锁，把并发签署在数据库层串行化，
+        # 避免延迟事务的 SHARED→RESERVED 锁升级死锁；详见自定义引擎。
+        "ENGINE": "warehouse_system.sqlite",
         "NAME": os.environ.get("SQLITE_PATH", str(BASE_DIR / "db.sqlite3")),
         "OPTIONS": {"timeout": 20},
     }
